@@ -23,8 +23,8 @@
 ## 설치
 
 ```bash
-git clone <repo-url>
-cd saramin_scraper
+git clone https://github.com/dlwngml0721/saramin-scraper.git
+cd saramin-scraper
 pip install -r requirements.txt
 ```
 
