@@ -148,7 +148,58 @@ def _find_contact_links(html, base_url):
 
 
 # ═══════════════════════════════════════
-# DB (공고 ID 기준 중복 체크)
+# CSV 기반 중복 체크 (Git 공유용)
+# ═══════════════════════════════════════
+
+def load_history_from_csvs():
+    """output/ 폴더의 기존 CSV에서 수집 이력 로드.
+    Returns: (seen_companies: dict[name -> date_str], seen_posting_ids: set)
+    """
+    seen_companies = {}   # company_name -> 가장 최근 수집일 (파일명 기반)
+    seen_posting_ids = set()
+
+    if not os.path.exists(OUTPUT_DIR):
+        return seen_companies, seen_posting_ids
+
+    for fname in sorted(os.listdir(OUTPUT_DIR)):
+        if not fname.endswith(".csv"):
+            continue
+
+        # 파일명에서 날짜 추출: recruit_20260430_1320.csv → 2026-04-30
+        date_str = ""
+        match = re.search(r"(\d{8})_\d{4}", fname)
+        if match:
+            d = match.group(1)
+            date_str = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+
+        filepath = os.path.join(OUTPUT_DIR, fname)
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    name = row.get("기업명", "").strip()
+                    if name:
+                        seen_companies[name] = date_str
+        except (csv.Error, KeyError, UnicodeDecodeError):
+            continue
+
+    return seen_companies, seen_posting_ids
+
+
+def is_company_in_cooldown_csv(seen_companies, company_name):
+    """CSV 이력 기반 회사 쿨다운 체크"""
+    date_str = seen_companies.get(company_name)
+    if not date_str:
+        return False
+    try:
+        last_at = datetime.strptime(date_str, "%Y-%m-%d")
+        return (datetime.now() - last_at).days < COMPANY_COOLDOWN_DAYS
+    except (ValueError, TypeError):
+        return False
+
+
+# ═══════════════════════════════════════
+# DB (로컬 캐시 — 없어도 CSV로 동작)
 # ═══════════════════════════════════════
 
 def init_db():
@@ -583,6 +634,11 @@ def main():
     conn = init_db()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # CSV 이력 로드 (Git 공유 중복 체크)
+    print("\n기존 CSV 이력 로드 중...", end=" ", flush=True)
+    seen_companies, _ = load_history_from_csvs()
+    print(f"{len(seen_companies)}개 회사 이력 발견")
+
     all_companies = {}  # company_name -> data
     new_postings = 0
     skipped_postings = 0
@@ -600,19 +656,22 @@ def main():
             for r in results:
                 pid = r["posting_id"]
 
-                # 공고 ID 중복 체크
+                # 공고 ID 중복 체크 (로컬 DB)
                 if pid and is_posting_seen(conn, pid):
                     skipped_postings += 1
                     continue
 
-                # 공고 저장
+                # 공고 저장 (로컬 DB)
                 if pid:
                     save_posting(conn, pid, r["source"], r["company_name"], kw)
                     new_postings += 1
 
                 name = r["company_name"]
 
-                # 회사 쿨다운 체크
+                # 회사 쿨다운 체크 (CSV 이력 기반 — Git 공유)
+                if is_company_in_cooldown_csv(seen_companies, name):
+                    continue
+                # 로컬 DB 쿨다운도 체크
                 if is_company_in_cooldown(conn, name):
                     continue
 

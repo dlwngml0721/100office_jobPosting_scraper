@@ -41,15 +41,23 @@ python scraper.py
 
 ## 중복 관리
 
-- `postings` 테이블: 공고 ID 기준으로 이미 본 공고를 기록
-- `companies` 테이블: 회사별 마지막 CSV 포함 일시를 기록 (30일 쿨다운)
+**CSV 기반 (Git 공유):**
+- `output/` 폴더의 기존 CSV 파일을 읽어서 이미 수집된 회사를 자동 스킵
+- 같은 회사가 CSV에 다시 포함되려면 **30일** 쿨다운 필요
+- 팀원 모두 같은 이력을 공유하려면 실행 후 반드시 CSV를 commit & push
 
-같은 회사가 매주 새 공고를 올려도 **30일 내에는 CSV에 중복 포함되지 않습니다.**
+**로컬 DB (개인 캐시):**
+- `scraper_history.db`는 `.gitignore`에 포함 (로컬 전용)
+- 공고 ID 기준 중복 체크용 캐시 역할
 
-DB를 초기화하고 싶으면:
+### 사용 흐름
 
 ```bash
-rm scraper_history.db
+git pull                  # 최신 CSV 이력 받기
+python scraper.py         # 실행
+git add output/           # 결과 CSV 스테이징
+git commit -m "수집 결과 추가"
+git push                  # 팀과 공유
 ```
 
 ## 설정 변경
