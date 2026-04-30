@@ -68,6 +68,9 @@ git push                  # 팀과 공유
 # 검색 키워드
 KEYWORDS = ["경영지원", "경리", "총무", ...]
 
+# 이메일 수집 목표 건수 (이 수만큼 모이면 자동 종료)
+TARGET_EMAILS = 50
+
 # 같은 회사 재포함 간격 (일)
 COMPANY_COOLDOWN_DAYS = 30
 ```

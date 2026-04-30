@@ -624,63 +624,57 @@ def scrape_email_from_website(url):
 # 메인
 # ═══════════════════════════════════════
 
-def main():
-    print("=" * 60)
-    print(" 채용 공고 회사 이메일 수집기 (사람인 + 잡코리아)")
-    print(f" 실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f" 회사 쿨다운: {COMPANY_COOLDOWN_DAYS}일")
-    print("=" * 60)
+TARGET_EMAILS = 50  # 이메일 수집 목표 건수
+MAX_PAGES = 10      # 키워드당 최대 검색 페이지
 
-    conn = init_db()
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # CSV 이력 로드 (Git 공유 중복 체크)
-    print("\n기존 CSV 이력 로드 중...", end=" ", flush=True)
-    seen_companies, _ = load_history_from_csvs()
-    print(f"{len(seen_companies)}개 회사 이력 발견")
+def collect_candidates(conn, seen_companies):
+    """사람인 + 잡코리아에서 신규 회사 후보를 페이지네이션으로 수집.
+    Generator로 한 회사씩 yield.
+    """
+    seen_names = set()  # 이번 실행에서 이미 yield한 회사명
 
-    all_companies = {}  # company_name -> data
-    new_postings = 0
-    skipped_postings = 0
+    for page in range(1, MAX_PAGES + 1):
+        has_results = False
 
-    # ── 1단계: 공고 검색 (사람인 + 잡코리아) ──
-    print("\n[1/3] 공고 검색 중...")
-
-    for site_name, search_fn in [("사람인", search_saramin), ("잡코리아", search_jobkorea)]:
-        print(f"\n  [{site_name}]")
-        for kw in KEYWORDS:
-            print(f"    '{kw}' 검색 중...", end=" ", flush=True)
-            results = search_fn(kw)
-            site_new = 0
-
-            for r in results:
-                pid = r["posting_id"]
-
-                # 공고 ID 중복 체크 (로컬 DB)
-                if pid and is_posting_seen(conn, pid):
-                    skipped_postings += 1
-                    continue
-
-                # 공고 저장 (로컬 DB)
-                if pid:
-                    save_posting(conn, pid, r["source"], r["company_name"], kw)
-                    new_postings += 1
-
-                name = r["company_name"]
-
-                # 회사 쿨다운 체크 (CSV 이력 기반 — Git 공유)
-                if is_company_in_cooldown_csv(seen_companies, name):
-                    continue
-                # 로컬 DB 쿨다운도 체크
-                if is_company_in_cooldown(conn, name):
-                    continue
-
-                if name in all_companies:
-                    existing_kws = all_companies[name]["keywords"].split(", ")
-                    if kw not in existing_kws:
-                        all_companies[name]["keywords"] += f", {kw}"
+        for site_name, search_fn in [("사람인", search_saramin), ("잡코리아", search_jobkorea)]:
+            for kw in KEYWORDS:
+                if page == 1:
+                    print(f"    [{site_name}] '{kw}' p{page}...", end=" ", flush=True)
                 else:
-                    all_companies[name] = {
+                    print(f"    [{site_name}] '{kw}' p{page}...", end=" ", flush=True)
+
+                results = search_fn(kw, page=page)
+                new_count = 0
+
+                for r in results:
+                    pid = r["posting_id"]
+
+                    # 공고 ID 중복 체크 (로컬 DB)
+                    if pid and is_posting_seen(conn, pid):
+                        continue
+
+                    # 공고 저장 (로컬 DB)
+                    if pid:
+                        save_posting(conn, pid, r["source"], r["company_name"], kw)
+
+                    name = r["company_name"]
+
+                    # 이미 이번 실행에서 처리한 회사
+                    if name in seen_names:
+                        continue
+
+                    # 회사 쿨다운 체크
+                    if is_company_in_cooldown_csv(seen_companies, name):
+                        continue
+                    if is_company_in_cooldown(conn, name):
+                        continue
+
+                    seen_names.add(name)
+                    new_count += 1
+                    has_results = True
+
+                    yield {
                         "company_name": name,
                         "keywords": kw,
                         "corp_link": r.get("corp_link", ""),
@@ -690,81 +684,118 @@ def main():
                         "email": "",
                         "website": "",
                     }
-                    site_new += 1
 
-            print(f"{len(results)}건 발견, 신규 회사 {site_new}건")
-            time.sleep(2)  # 차단 방지
+                print(f"{len(results)}건, 신규 {new_count}건")
+                time.sleep(2)
 
-    total = len(all_companies)
-    print(f"\n  신규 공고: {new_postings}건 (스킵: {skipped_postings}건)")
+        if not has_results:
+            print(f"\n  페이지 {page}에서 더 이상 신규 공고 없음. 검색 종료.")
+            break
 
-    if total == 0:
-        print("\n신규 수집 대상이 없습니다.")
-        conn.close()
-        return
 
-    print(f"  수집 대상 회사: {total}개")
+def process_company(data):
+    """회사 정보 수집 + 이메일 수집을 한 번에 처리"""
+    name = data["company_name"]
 
-    # ── 2단계: 회사 상세 정보 수집 ──
-    print("\n[2/3] 회사 정보 수집 중 (대표자명, 홈페이지)...")
-    for i, (name, data) in enumerate(all_companies.items(), 1):
-        print(f"  ({i}/{total}) {name}...", end=" ", flush=True)
+    # 회사 정보 수집
+    if data["corp_link"]:
+        info = get_company_info_from_saramin(data["corp_link"])
+    else:
+        info = get_company_info_from_jobkorea(name)
 
-        if data["corp_link"]:
-            # 사람인 기업 페이지에서 직접 수집
-            info = get_company_info_from_saramin(data["corp_link"])
+    data["ceo_name"] = info["ceo_name"]
+    data["website"] = info["website"]
+
+    # 이메일 수집
+    if data["website"]:
+        data["email"] = scrape_email_from_website(data["website"])
+
+    return data
+
+
+def main():
+    print("=" * 60)
+    print(" 채용 공고 회사 이메일 수집기 (사람인 + 잡코리아)")
+    print(f" 실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f" 목표: 이메일 {TARGET_EMAILS}건 수집")
+    print(f" 회사 쿨다운: {COMPANY_COOLDOWN_DAYS}일")
+    print("=" * 60)
+
+    conn = init_db()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # CSV 이력 로드
+    print("\n기존 CSV 이력 로드 중...", end=" ", flush=True)
+    seen_companies, _ = load_history_from_csvs()
+    print(f"{len(seen_companies)}개 회사 이력 발견")
+
+    # ── 수집 시작 ──
+    print(f"\n[수집 중] 이메일 {TARGET_EMAILS}건 목표로 진행합니다...")
+    print("  공고 검색:")
+
+    results_with_email = []
+    results_no_email = []
+    total_processed = 0
+
+    for candidate in collect_candidates(conn, seen_companies):
+        total_processed += 1
+        name = candidate["company_name"]
+
+        print(f"\n  [{total_processed}] {name}...", end=" ", flush=True)
+
+        data = process_company(candidate)
+
+        ceo_status = data["ceo_name"] or "-"
+        site_status = "O" if data["website"] else "X"
+
+        if data["email"]:
+            results_with_email.append(data)
+            print(f"대표: {ceo_status}, 이메일: {data['email']} ✓ ({len(results_with_email)}/{TARGET_EMAILS})")
         else:
-            # 잡코리아 공고 → 사람인에서 회사명으로 검색
-            info = get_company_info_from_jobkorea(name)
+            results_no_email.append(data)
+            print(f"대표: {ceo_status}, 사이트: {site_status}, 이메일: -")
 
-        data["ceo_name"] = info["ceo_name"]
-        data["website"] = info["website"]
-        print(f"대표: {info['ceo_name'] or '-'}, 사이트: {'O' if info['website'] else 'X'}")
-        time.sleep(0.8)
+        # 목표 달성 체크
+        if len(results_with_email) >= TARGET_EMAILS:
+            print(f"\n  목표 {TARGET_EMAILS}건 달성!")
+            break
 
-    # ── 3단계: 이메일 수집 ──
-    print("\n[3/3] 회사 홈페이지에서 이메일 수집 중...")
-    has_website = [d for d in all_companies.values() if d["website"]]
-    print(f"  홈페이지 있는 회사: {len(has_website)}/{total}개")
-
-    for i, data in enumerate(has_website, 1):
-        print(f"  ({i}/{len(has_website)}) {data['company_name']}...", end=" ", flush=True)
-        email = scrape_email_from_website(data["website"])
-        data["email"] = email
-        print(email or "-")
         time.sleep(0.5)
 
     # ── 결과 저장 ──
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     csv_path = os.path.join(OUTPUT_DIR, f"recruit_{timestamp}.csv")
 
-    email_count = 0
+    email_count = len(results_with_email)
+
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["기업명", "대표자명", "공고 키워드", "이메일", "홈페이지", "출처"])
-        for data in all_companies.values():
-            has_email = bool(data["email"])
-            save_company(conn, data, included_in_csv=has_email)
-            if has_email:
-                writer.writerow([
-                    data["company_name"],
-                    data["ceo_name"],
-                    data["keywords"],
-                    data["email"],
-                    data["website"],
-                    data.get("source", ""),
-                ])
-                email_count += 1
+        for data in results_with_email:
+            save_company(conn, data, included_in_csv=True)
+            writer.writerow([
+                data["company_name"],
+                data["ceo_name"],
+                data["keywords"],
+                data["email"],
+                data["website"],
+                data.get("source", ""),
+            ])
+
+    # 이메일 없는 회사도 DB에 기록 (다음 실행 시 참고)
+    for data in results_no_email:
+        save_company(conn, data, included_in_csv=False)
 
     conn.close()
 
-    with_ceo = sum(1 for d in all_companies.values() if d["ceo_name"])
+    with_ceo = sum(1 for d in results_with_email if d["ceo_name"])
 
     print("\n" + "=" * 60)
     print(" 수집 완료!")
-    print(f" 총 회사 수: {total}")
-    print(f" 이메일 수집 성공: {email_count}건 (CSV에 저장됨)")
-    print(f" 이메일 없는 회사: {total - email_count}건 (CSV에서 제외)")
+    print(f" 탐색한 회사: {total_processed}개")
+    print(f" 이메일 수집: {email_count}건 (CSV에 저장됨)")
+    if email_count < TARGET_EMAILS:
+        print(f" ⚠ 목표 {TARGET_EMAILS}건 미달 — 신규 공고가 부족합니다")
     print(f" 대표자명 수집: {with_ceo}건")
     print(f" 저장 위치: {csv_path}")
     print("=" * 60)
