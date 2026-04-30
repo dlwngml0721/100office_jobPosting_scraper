@@ -54,6 +54,7 @@ IGNORE_EMAILS_EXACT = {
     "admin@example.com", "user@example.com",
     "you@website.com", "mytory@gmail.com",
     "highlight@sedaily.com", "greenremodeling@kalis.or.kr",
+    "enquiry@jejudreamtower.com",
 }
 
 IGNORE_EMAIL_PREFIXES = [
@@ -268,12 +269,19 @@ def search_saramin(keyword, page=1):
         "searchPeriod": "7",
     }
 
-    try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"  [오류] 사람인 '{keyword}' 검색 실패: {e}")
-        return []
+    # 최대 2회 재시도 (사람인 일시 차단 대응)
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            break
+        except requests.RequestException as e:
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+            else:
+                print(f"  [오류] 사람인 '{keyword}' 검색 실패: {e}")
+                return []
 
     soup = BeautifulSoup(resp.text, "lxml")
     results = []
@@ -626,7 +634,7 @@ def main():
                     site_new += 1
 
             print(f"{len(results)}건 발견, 신규 회사 {site_new}건")
-            time.sleep(1)
+            time.sleep(2)  # 차단 방지
 
     total = len(all_companies)
     print(f"\n  신규 공고: {new_postings}건 (스킵: {skipped_postings}건)")
