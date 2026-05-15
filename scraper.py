@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-채용 공고 회사 이메일 수집기 (사람인 + 잡코리아)
-- 사람인/잡코리아에서 키워드별 최근 1주일 공고 검색
+채용 공고 회사 이메일 수집기 (사람인 + 잡코리아 + 원티드)
+- 사람인/잡코리아/원티드에서 키워드별 최근 공고 검색
 - 공고 ID 기준 중복 체크, 같은 회사 30일 쿨다운
 - 회사 공식 사이트에서 공개 이메일 수집
 - CSV 출력 (이메일 있는 회사만)
 """
 
+import argparse
 import requests
 from bs4 import BeautifulSoup
 import sqlite3
@@ -528,6 +529,60 @@ def get_company_info_from_jobkorea(company_name):
 
 
 # ═══════════════════════════════════════
+# 원티드 검색
+# ═══════════════════════════════════════
+
+def search_wanted(keyword, page=1):
+    """원티드 API를 사용하여 채용공고 검색"""
+    url = "https://www.wanted.co.kr/api/v4/jobs"
+    limit = 20
+    offset = (page - 1) * limit
+    params = {
+        "query": keyword,
+        "country": "kr",
+        "job_sort": "job.latest_order",
+        "limit": limit,
+        "offset": offset,
+        "locations": "all",
+        "years": -1,
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        print(f"  [오류] 원티드 '{keyword}' 검색 실패: {e}")
+        return []
+
+    results = []
+    for job in data.get("data", []):
+        company = job.get("company", {})
+        company_name = company.get("name", "").strip()
+        if not company_name:
+            continue
+
+        job_id = job.get("id", "")
+        position = job.get("position", "")
+
+        results.append({
+            "posting_id": f"wanted_{job_id}" if job_id else "",
+            "source": "wanted",
+            "company_name": company_name,
+            "job_title": position,
+            "keyword": keyword,
+            "corp_link": "",  # 원티드는 사람인으로 기업 정보 대체
+        })
+
+    return results
+
+
+def get_company_info_from_wanted(company_name):
+    """원티드에는 홈페이지/대표자 정보가 없으므로, 사람인에서 회사명으로 검색"""
+    return get_company_info_from_jobkorea(company_name)
+
+
+# ═══════════════════════════════════════
 # 이메일 수집
 # ═══════════════════════════════════════
 
@@ -637,7 +692,7 @@ def collect_candidates(conn, seen_companies):
     for page in range(1, MAX_PAGES + 1):
         has_results = False
 
-        for site_name, search_fn in [("사람인", search_saramin), ("잡코리아", search_jobkorea)]:
+        for site_name, search_fn in [("사람인", search_saramin), ("잡코리아", search_jobkorea), ("원티드", search_wanted)]:
             for kw in KEYWORDS:
                 if page == 1:
                     print(f"    [{site_name}] '{kw}' p{page}...", end=" ", flush=True)
@@ -700,6 +755,8 @@ def process_company(data):
     # 회사 정보 수집
     if data["corp_link"]:
         info = get_company_info_from_saramin(data["corp_link"])
+    elif data["source"] == "wanted":
+        info = get_company_info_from_wanted(name)
     else:
         info = get_company_info_from_jobkorea(name)
 
@@ -714,10 +771,16 @@ def process_company(data):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="채용 공고 회사 이메일 수집기")
+    parser.add_argument("-n", type=int, default=TARGET_EMAILS,
+                        help=f"수집 목표 건수 (기본값: {TARGET_EMAILS})")
+    args = parser.parse_args()
+    target_emails = args.n
+
     print("=" * 60)
-    print(" 채용 공고 회사 이메일 수집기 (사람인 + 잡코리아)")
+    print(" 채용 공고 회사 이메일 수집기 (사람인 + 잡코리아 + 원티드)")
     print(f" 실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f" 목표: 이메일 {TARGET_EMAILS}건 수집")
+    print(f" 목표: 이메일 {target_emails}건 수집")
     print(f" 회사 쿨다운: {COMPANY_COOLDOWN_DAYS}일")
     print("=" * 60)
 
@@ -730,7 +793,7 @@ def main():
     print(f"{len(seen_companies)}개 회사 이력 발견")
 
     # ── 수집 시작 ──
-    print(f"\n[수집 중] 이메일 {TARGET_EMAILS}건 목표로 진행합니다...")
+    print(f"\n[수집 중] 이메일 {target_emails}건 목표로 진행합니다...")
     print("  공고 검색:")
 
     results_with_email = []
@@ -750,14 +813,14 @@ def main():
 
         if data["email"]:
             results_with_email.append(data)
-            print(f"대표: {ceo_status}, 이메일: {data['email']} ✓ ({len(results_with_email)}/{TARGET_EMAILS})")
+            print(f"대표: {ceo_status}, 이메일: {data['email']} ✓ ({len(results_with_email)}/{target_emails})")
         else:
             results_no_email.append(data)
             print(f"대표: {ceo_status}, 사이트: {site_status}, 이메일: -")
 
         # 목표 달성 체크
-        if len(results_with_email) >= TARGET_EMAILS:
-            print(f"\n  목표 {TARGET_EMAILS}건 달성!")
+        if len(results_with_email) >= target_emails:
+            print(f"\n  목표 {target_emails}건 달성!")
             break
 
         time.sleep(0.5)
@@ -794,8 +857,8 @@ def main():
     print(" 수집 완료!")
     print(f" 탐색한 회사: {total_processed}개")
     print(f" 이메일 수집: {email_count}건 (CSV에 저장됨)")
-    if email_count < TARGET_EMAILS:
-        print(f" ⚠ 목표 {TARGET_EMAILS}건 미달 — 신규 공고가 부족합니다")
+    if email_count < target_emails:
+        print(f" ⚠ 목표 {target_emails}건 미달 — 신규 공고가 부족합니다")
     print(f" 대표자명 수집: {with_ceo}건")
     print(f" 저장 위치: {csv_path}")
     print("=" * 60)
