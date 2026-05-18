@@ -98,7 +98,7 @@ def _fetch_page(url, timeout=8):
         if resp.status_code != 200:
             return None
         return resp.text
-    except requests.RequestException:
+    except (requests.RequestException, UnicodeError):
         return None
 
 
@@ -185,6 +185,28 @@ def load_history_from_csvs():
             continue
 
     return seen_companies, seen_posting_ids
+
+
+def load_emails_from_csvs():
+    """output/ 폴더의 기존 CSV에서 이메일 → 회사명 매핑 로드 (중복 감지용)"""
+    email_map = {}  # email -> company_name
+    if not os.path.exists(OUTPUT_DIR):
+        return email_map
+    for fname in sorted(os.listdir(OUTPUT_DIR)):
+        if not fname.endswith(".csv"):
+            continue
+        filepath = os.path.join(OUTPUT_DIR, fname)
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    email = row.get("이메일", "").strip().lower()
+                    name = row.get("기업명", "").strip()
+                    if email and name:
+                        email_map[email] = name
+        except (csv.Error, KeyError, UnicodeDecodeError):
+            continue
+    return email_map
 
 
 def is_company_in_cooldown_csv(seen_companies, company_name):
@@ -501,31 +523,183 @@ def search_jobkorea(keyword, page=1):
     return results
 
 
-def get_company_info_from_jobkorea(company_name):
-    """잡코리아에는 기업 상세 정보 접근이 어려우므로, 사람인에서 회사명으로 검색"""
-    info = {"ceo_name": "", "website": ""}
-
-    # 사람인에서 회사명 검색
-    url = "https://www.saramin.co.kr/zf_user/search/company"
-    params = {"searchword": company_name, "searchType": "search"}
+def search_google_for_website(company_name):
+    """구글 검색으로 회사 공식 홈페이지 찾기"""
+    query = f"{company_name} 공식 홈페이지"
+    url = "https://www.google.com/search"
+    params = {"q": query, "hl": "ko", "num": 5}
 
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
         resp.raise_for_status()
     except requests.RequestException:
-        return info
+        return ""
 
     soup = BeautifulSoup(resp.text, "lxml")
 
-    # 첫 번째 기업 결과의 링크
-    corp_link_tag = soup.select_one(".corp_name a, .company_nm a, [class*='corp'] a")
-    if corp_link_tag and corp_link_tag.get("href"):
-        corp_link = corp_link_tag["href"]
-        if not corp_link.startswith("http"):
-            corp_link = "https://www.saramin.co.kr" + corp_link
-        return get_company_info_from_saramin(corp_link)
+    # 구글 검색 결과에서 링크 추출
+    skip_domains = {
+        "google.com", "google.co.kr", "youtube.com",
+        "saramin.co.kr", "jobkorea.co.kr", "wanted.co.kr",
+        "incruit.com", "alba.co.kr", "catch.co.kr",
+        "naver.com", "daum.net", "kakao.com",
+        "facebook.com", "instagram.com", "twitter.com", "x.com",
+        "linkedin.com", "blog.naver.com", "tistory.com",
+        "wikipedia.org", "namu.wiki", "namuwiki.kr",
+        "jobplanet.co.kr", "glassdoor.com",
+        "thevc.kr", "rocketpunch.com",
+        # 정보/구인/기업DB 사이트 (엉뚱한 매칭 방지)
+        "albamon.com", "nicebizinfo.com", "moneypin.biz", "bizno.net",
+        "career.rememberapp.co.kr", "blog.kakaocdn.net",
+        "allthatcompany.com", "hiseoul.sba.kr", "teamblind.com",
+        "demoday.co.kr", "comp.wisereport.co.kr",
+        "greetinghr.com", "ninehire.site",
+        "tiktok.com", "threads.net",
+    }
+
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        # 구글 리다이렉트 URL 파싱
+        if href.startswith("/url?"):
+            match = re.search(r"q=(https?://[^&]+)", href)
+            if match:
+                href = match.group(1)
+        if not href.startswith("http"):
+            continue
+
+        parsed = urlparse(href)
+        domain = parsed.netloc.lower().replace("www.", "")
+
+        if any(skip in domain for skip in skip_domains):
+            continue
+
+        # 회사 공식 사이트일 가능성이 높은 URL 반환
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    return ""
+
+
+def search_naver_for_website(company_name):
+    """네이버 검색으로 회사 공식 홈페이지 찾기 (구글 실패 시 폴백)"""
+    query = f"{company_name} 공식 홈페이지"
+    url = "https://search.naver.com/search.naver"
+    params = {"query": query}
+
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return ""
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    skip_domains = {
+        "naver.com", "naver.me", "navercorp.com",
+        "daum.net", "kakao.com", "google.com",
+        "youtube.com", "facebook.com", "instagram.com",
+        "twitter.com", "x.com", "linkedin.com", "tistory.com",
+        "wikipedia.org", "namu.wiki",
+        "saramin.co.kr", "jobkorea.co.kr", "wanted.co.kr",
+        "jobplanet.co.kr", "glassdoor.com",
+        "thevc.kr", "rocketpunch.com",
+        "albamon.com", "nicebizinfo.com", "moneypin.biz", "bizno.net",
+        "career.rememberapp.co.kr", "blog.kakaocdn.net",
+        "allthatcompany.com", "hiseoul.sba.kr", "teamblind.com",
+        "demoday.co.kr", "comp.wisereport.co.kr",
+        "greetinghr.com", "ninehire.site",
+        "tiktok.com", "threads.net",
+    }
+
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if not href.startswith("http"):
+            continue
+        parsed = urlparse(href)
+        domain = parsed.netloc.lower().replace("www.", "")
+        if any(skip in domain for skip in skip_domains):
+            continue
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    return ""
+
+
+def find_company_website(company_name):
+    """구글 → 네이버 순서로 회사 공식 홈페이지 검색"""
+    website = search_google_for_website(company_name)
+    if website:
+        return website
+    time.sleep(1)
+    return search_naver_for_website(company_name)
+
+
+def get_ceo_from_website(html):
+    """홈페이지 HTML에서 대표자명 추출 시도"""
+    if not html:
+        return ""
+
+    # 쓰레기 단어 필터 (대표 뒤에 올 수 없는 단어들)
+    garbage_words = {
+        "이사", "전화", "번호", "인사", "인사말", "브랜드", "서비스",
+        "기업", "회사", "사이트", "홈페이지", "이미지", "카테고리",
+        "아르바이", "스타트업", "솔루션", "미디어", "인터뷰",
+        "제품", "상품", "매장", "지점", "사업", "프로젝트",
+        "선임", "주관", "계약", "화면", "원장", "커피",
+        "차량", "후보", "연구", "제약", "강소", "자명",
+        "전화번호", "이미지설", "미디어사", "커피전시", "에게바란",
+        "브랜드입", "서비스입", "주관계약", "제약사로", "차량선택",
+        "전력회사", "이미지주", "어린이수", "아르바이트",
+        "님까지", "에게", "하는", "적이다", "적인", "신간",
+        "번호를", "성함", "회의", "봉새롬",
+    }
+
+    # "대표이사 : 홍길동" 또는 "대표자 : 홍길동" 같은 정형화된 패턴
+    # 반드시 콜론/구분자가 있어야 매칭 (느슨한 매칭 방지)
+    patterns = [
+        r"대표(?:이사|자)\s*[:：]\s*([가-힣]{2,4})",
+        r"CEO\s*[:：]\s*([가-힣]{2,4})",
+        r"대표(?:이사|자)\s*</(?:dt|th|td|span|div|strong)>\s*<(?:dd|td|span|div)[^>]*>\s*([가-힣]{2,4})",
+    ]
+    for pat in patterns:
+        match = re.search(pat, html)
+        if match:
+            name = match.group(1).strip()
+            if name not in garbage_words and len(name) >= 2:
+                return name
+    return ""
+
+
+def get_company_info_by_search(company_name):
+    """구글/네이버 검색으로 회사 홈페이지를 찾고 대표자명 추출"""
+    info = {"ceo_name": "", "website": ""}
+
+    website = find_company_website(company_name)
+    if not website:
+        return info
+
+    info["website"] = website
+
+    # 홈페이지에서 대표자명 추출 시도
+    html = _fetch_page(website)
+    if html:
+        info["ceo_name"] = get_ceo_from_website(html)
+
+        # 메인에 없으면 회사소개 페이지에서 시도
+        if not info["ceo_name"]:
+            for path in ["/about", "/about-us", "/company", "/회사소개", "/company/about"]:
+                about_html = _fetch_page(website.rstrip("/") + path)
+                if about_html:
+                    ceo = get_ceo_from_website(about_html)
+                    if ceo:
+                        info["ceo_name"] = ceo
+                        break
+                    time.sleep(0.3)
 
     return info
+
+
+def get_company_info_from_jobkorea(company_name):
+    """구글/네이버 검색으로 회사 정보 수집"""
+    return get_company_info_by_search(company_name)
 
 
 # ═══════════════════════════════════════
@@ -578,8 +752,8 @@ def search_wanted(keyword, page=1):
 
 
 def get_company_info_from_wanted(company_name):
-    """원티드에는 홈페이지/대표자 정보가 없으므로, 사람인에서 회사명으로 검색"""
-    return get_company_info_from_jobkorea(company_name)
+    """구글/네이버 검색으로 회사 정보 수집"""
+    return get_company_info_by_search(company_name)
 
 
 # ═══════════════════════════════════════
@@ -752,13 +926,18 @@ def process_company(data):
     """회사 정보 수집 + 이메일 수집을 한 번에 처리"""
     name = data["company_name"]
 
-    # 회사 정보 수집
+    # 회사 정보 수집: 사람인 corp_link가 있으면 먼저 시도
+    info = {"ceo_name": "", "website": ""}
     if data["corp_link"]:
         info = get_company_info_from_saramin(data["corp_link"])
-    elif data["source"] == "wanted":
-        info = get_company_info_from_wanted(name)
-    else:
-        info = get_company_info_from_jobkorea(name)
+
+    # 사람인에서 website 못 찾았으면 구글/네이버 검색으로 폴백
+    if not info["website"]:
+        search_info = get_company_info_by_search(name)
+        if search_info["website"]:
+            info["website"] = search_info["website"]
+        if not info["ceo_name"] and search_info["ceo_name"]:
+            info["ceo_name"] = search_info["ceo_name"]
 
     data["ceo_name"] = info["ceo_name"]
     data["website"] = info["website"]
@@ -790,7 +969,8 @@ def main():
     # CSV 이력 로드
     print("\n기존 CSV 이력 로드 중...", end=" ", flush=True)
     seen_companies, _ = load_history_from_csvs()
-    print(f"{len(seen_companies)}개 회사 이력 발견")
+    seen_emails = load_emails_from_csvs()
+    print(f"{len(seen_companies)}개 회사, {len(seen_emails)}개 이메일 이력 발견")
 
     # ── 수집 시작 ──
     print(f"\n[수집 중] 이메일 {target_emails}건 목표로 진행합니다...")
@@ -799,6 +979,7 @@ def main():
     results_with_email = []
     results_no_email = []
     total_processed = 0
+    email_usage = dict(seen_emails)  # 기존 CSV 이력의 이메일도 포함 (중복 감지용)
 
     for candidate in collect_candidates(conn, seen_companies):
         total_processed += 1
@@ -812,8 +993,16 @@ def main():
         site_status = "O" if data["website"] else "X"
 
         if data["email"]:
-            results_with_email.append(data)
-            print(f"대표: {ceo_status}, 이메일: {data['email']} ✓ ({len(results_with_email)}/{target_emails})")
+            email = data["email"].lower()
+            # 이메일 중복 감지: 서로 다른 기업인데 같은 이메일이면 스킵
+            if email in email_usage:
+                prev_company = email_usage[email]
+                print(f"대표: {ceo_status}, 이메일: {email} ✗ 중복 ('{prev_company}'과 동일 이메일, 스킵)")
+                results_no_email.append(data)
+            else:
+                email_usage[email] = name
+                results_with_email.append(data)
+                print(f"대표: {ceo_status}, 이메일: {data['email']} ✓ ({len(results_with_email)}/{target_emails})")
         else:
             results_no_email.append(data)
             print(f"대표: {ceo_status}, 사이트: {site_status}, 이메일: -")
